@@ -42,7 +42,8 @@ jobs:
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
-          git add registro_senales.csv estado.json 2>/dev/null || true
+          [ -f registro_senales.csv ] && git add registro_senales.csv
+          [ -f estado.json ] && git add estado.json
           if git diff --cached --quiet; then
             echo "Nada nuevo para guardar."
           else
