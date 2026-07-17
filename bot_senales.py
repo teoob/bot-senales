@@ -240,6 +240,68 @@ def enviar_texto(txt: str):
         data={"chat_id": CHAT_ID, "text": txt, "parse_mode": "HTML"}, timeout=15)
     r.raise_for_status()
 
+def telegram_get(metodo: str, params: dict) -> dict:
+    r = requests.get(f"https://api.telegram.org/bot{TOKEN}/{metodo}", params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+# ---------------- COMANDOS (consulta manual desde Telegram) ----------------
+def responder_estado(comando: str):
+    if comando in ("/start", "/ayuda", "/help"):
+        enviar_texto(
+            "\U0001F916 Bot de se\u00f1ales TEO\n\n"
+            "Comandos:\n"
+            "/hoy o /estado - estado actual de los 5 pares\n\n"
+            "Las se\u00f1ales v\u00e1lidas te llegan solas, con chart, apenas se detectan "
+            "(chequeo autom\u00e1tico cada ~15 min)."
+        )
+        return
+
+    ahora = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lineas = [f"\U0001F4CA <b>Estado actual</b> ({ahora})"]
+    alguna = False
+    for par in PARES:
+        try:
+            s = analizar_par(par)
+        except Exception as ex:
+            lineas.append(f"\u26AA {par}: error consultando ({ex})")
+            continue
+        if s:
+            alguna = True
+            e = "\U0001F7E2" if s["lado"] == "LONG" else "\U0001F534"
+            lineas.append(f"{e} {par}: SE\u00d1AL {s['lado']} (te llega la captura aparte)")
+        else:
+            lineas.append(f"\u26AA {par}: sin se\u00f1al")
+    lineas.append("" )
+    lineas.append("Hay se\u00f1al activa \u2192 revis\u00e1 el mensaje con el chart." if alguna
+                   else "Ninguno cumple los filtros ahora mismo. Reintento autom\u00e1tico en ~15 min.")
+    enviar_texto("\n".join(lineas))
+
+
+def procesar_comandos(estado: dict) -> dict:
+    """Revisa si mandaste /hoy, /estado, etc. desde el ultimo chequeo y responde."""
+    offset = estado.get("update_offset", 0)
+    try:
+        data = telegram_get("getUpdates", {"offset": offset, "timeout": 0})
+    except Exception as ex:
+        print(f"error consultando comandos: {ex}")
+        return estado
+
+    for u in data.get("result", []):
+        estado["update_offset"] = u["update_id"] + 1
+        msg = u.get("message", {})
+        texto = (msg.get("text") or "").strip().lower()
+        chat = str(msg.get("chat", {}).get("id", ""))
+        if chat != str(CHAT_ID) or not texto.startswith("/"):
+            continue
+        print(f"comando recibido: {texto}")
+        try:
+            responder_estado(texto.split()[0])
+        except Exception as ex:
+            print(f"error respondiendo comando: {ex}")
+    return estado
+
 def armar_caption(s: dict) -> str:
     e = "\U0001F7E2" if s["lado"] == "LONG" else "\U0001F534"
     f = lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -327,12 +389,18 @@ def main():
         return
 
     if "--once" in sys.argv:
+        estado = cargar_estado()
+        estado = procesar_comandos(estado)
+        guardar_estado(estado)
         escanear(modo_once=True)
         return
 
     # loop continuo: escanea a los minutos :01, :16, :31, :46
     print("Bot iniciado en modo loop.")
     while True:
+        estado = cargar_estado()
+        estado = procesar_comandos(estado)
+        guardar_estado(estado)
         escanear(modo_once=False)
         ahora = datetime.now(timezone.utc)
         # resumen diario 17:00 UTC = 14:00 Argentina
