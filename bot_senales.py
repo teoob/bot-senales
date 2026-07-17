@@ -44,12 +44,15 @@ VENTANA_FRESCA_MIN = 16 # en modo --once: solo alerta si la vela cerró hace <16
 LOG_FILE   = "registro_senales.csv"
 STATE_FILE = "estado.json"
 
-BINANCE_FAPI = "https://fapi.binance.com/fapi/v1/klines"
+# Espejo publico de datos de Binance, sin restriccion geografica
+# (fapi.binance.com bloquea IPs de EEUU con error 451; este endpoint
+#  esta documentado por Binance para uso de bots/servicios externos)
+BINANCE_DATA = "https://data-api.binance.vision/api/v3/klines"
 
 
 # ---------------- DATOS ----------------
 def traer_velas(par: str, intervalo: str, limite: int = 300) -> pd.DataFrame:
-    r = requests.get(BINANCE_FAPI, params={
+    r = requests.get(BINANCE_DATA, params={
         "symbol": par, "interval": intervalo, "limit": limite
     }, timeout=15)
     r.raise_for_status()
