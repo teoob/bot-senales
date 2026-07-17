@@ -8,6 +8,9 @@
 # ============================================================
 name: bot-senales
 
+permissions:
+  contents: write   # necesario para que el bot pueda guardar su estado (git push)
+
 on:
   schedule:
     - cron: "*/5 * * * *"    # cada 5 min (puede demorar unos min extra)
@@ -40,5 +43,14 @@ jobs:
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           git add registro_senales.csv estado.json 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "registro y estado"
-          git push || true
+          if git diff --cached --quiet; then
+            echo "Nada nuevo para guardar."
+          else
+            git commit -m "registro y estado"
+            git pull --rebase origin main || true
+            if git push; then
+              echo "Estado guardado correctamente."
+            else
+              echo "::error::No se pudo guardar el estado (revisar permisos del workflow: Settings > Actions > General > Workflow permissions > Read and write)."
+            fi
+          fi
