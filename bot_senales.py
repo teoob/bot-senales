@@ -2,7 +2,7 @@
 ============================================================
  BOT DE SEÑALES - Sistema TEO
  Analiza SOL, ETH, BTC, BNB, XRP (futuros perpetuos Binance)
- cada 15 min y manda señales por Telegram con captura del chart.
+ cada 5 min y manda señales por Telegram con captura del chart.
 
  Sistema (1h, velas cerradas):
    - Cruce EMA 9/21 en la dirección del trade
@@ -17,7 +17,7 @@
  Modos:
    python bot_senales.py --test   -> manda mensaje de prueba
    python bot_senales.py --once   -> un escaneo y termina (GitHub Actions)
-   python bot_senales.py          -> loop continuo cada 15 min (VPS/Railway)
+   python bot_senales.py          -> loop continuo cada 15 min (VPS/Railway, ajustar sleep si se quiere 5 min)
 ============================================================
 """
 
@@ -254,7 +254,7 @@ def responder_estado(comando: str):
             "Comandos:\n"
             "/hoy o /estado - estado actual de los 5 pares\n\n"
             "Las se\u00f1ales v\u00e1lidas te llegan solas, con chart, apenas se detectan "
-            "(chequeo autom\u00e1tico cada ~15 min)."
+            "(chequeo autom\u00e1tico cada ~5 min)."
         )
         return
 
@@ -275,7 +275,7 @@ def responder_estado(comando: str):
             lineas.append(f"\u26AA {par}: sin se\u00f1al")
     lineas.append("" )
     lineas.append("Hay se\u00f1al activa \u2192 revis\u00e1 el mensaje con el chart." if alguna
-                   else "Ninguno cumple los filtros ahora mismo. Reintento autom\u00e1tico en ~15 min.")
+                   else "Ninguno cumple los filtros ahora mismo. Reintento autom\u00e1tico en ~5 min.")
     enviar_texto("\n".join(lineas))
 
 
