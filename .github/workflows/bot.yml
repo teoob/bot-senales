@@ -1,5 +1,5 @@
 # ============================================================
-# GitHub Actions - corre el bot cada 15 minutos, gratis.
+# GitHub Actions - corre el bot cada 5 minutos, gratis.
 # UBICACION OBLIGATORIA dentro del repo:
 #   .github/workflows/bot.yml
 # Secrets requeridos (Settings > Secrets and variables > Actions):
@@ -33,11 +33,12 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot_senales.py --once
 
-      # guarda el registro de señales dentro del repo (historial para el post-mortem)
-      - name: Guardar registro
+      # guarda el registro de señales Y el estado (offset de comandos,
+      # dedupe de señales ya enviadas) para que persistan entre corridas
+      - name: Guardar registro y estado
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
-          git add registro_senales.csv || true
-          git diff --cached --quiet || git commit -m "registro de señales"
+          git add registro_senales.csv estado.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "registro y estado"
           git push || true
