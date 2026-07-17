@@ -29,7 +29,7 @@ import time
 import json
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ---------------- CONFIG ----------------
 TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -258,8 +258,8 @@ def responder_estado(comando: str):
         )
         return
 
-    ahora = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    lineas = [f"\U0001F4CA <b>Estado actual</b> ({ahora})"]
+    ahora = (datetime.now(timezone.utc) + timedelta(hours=-3)).strftime("%H:%M")
+    lineas = [f"\U0001F4CA <b>Estado actual</b> ({ahora} ART)"]
     alguna = False
     for par in PARES:
         try:
@@ -395,26 +395,34 @@ def main():
         escanear(modo_once=True)
         return
 
-    # loop continuo: escanea a los minutos :01, :16, :31, :46
+    # loop continuo (Railway/VPS): responde comandos casi al instante,
+    # y escanea los pares cada 5 minutos
     print("Bot iniciado en modo loop.")
+    ultimo_escaneo = 0.0
+    ultimo_resumen_dia = ""
     while True:
         estado = cargar_estado()
         estado = procesar_comandos(estado)
         guardar_estado(estado)
-        escanear(modo_once=False)
-        ahora = datetime.now(timezone.utc)
-        # resumen diario 17:00 UTC = 14:00 Argentina
-        if ahora.hour == 17 and ahora.minute < 15:
-            hoy = ahora.date().isoformat()
-            est = cargar_estado()
-            if est.get("resumen") != hoy:
-                enviadas_hoy = any(hoy in v for k, v in est.items() if k != "resumen")
-                if not enviadas_hoy:
-                    enviar_texto("\U0001F4CB 14:00 ART - Sesi\u00f3n sin se\u00f1ales v\u00e1lidas. Sesi\u00f3n cerrada seg\u00fan regla. D\u00eda de replay/backtesting.")
-                est["resumen"] = hoy
-                guardar_estado(est)
-        faltan = 900 - (ahora.minute % 15) * 60 - ahora.second + 60
-        time.sleep(max(60, faltan))
+
+        ahora_ts = time.time()
+        if ahora_ts - ultimo_escaneo >= 300:  # 5 minutos
+            escanear(modo_once=False)
+            ultimo_escaneo = ahora_ts
+
+            ahora = datetime.now(timezone.utc)
+            if ahora.hour == 17 and ahora.minute < 5:  # 14:00 ART
+                hoy = ahora.date().isoformat()
+                if ultimo_resumen_dia != hoy:
+                    est = cargar_estado()
+                    enviadas_hoy = any(hoy in str(v) for k, v in est.items()
+                                        if k not in ("resumen", "update_offset"))
+                    if not enviadas_hoy:
+                        enviar_texto("\U0001F4CB 14:00 ART - Sesi\u00f3n sin se\u00f1ales v\u00e1lidas. "
+                                     "Sesi\u00f3n cerrada seg\u00fan regla. D\u00eda de replay/backtesting.")
+                    ultimo_resumen_dia = hoy
+
+        time.sleep(10)  # chequeo de comandos, casi instant\u00e1neo
 
 
 if __name__ == "__main__":
