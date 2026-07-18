@@ -1,23 +1,20 @@
 """
 ============================================================
- BOT DE SEÑALES - Sistema TEO
+ BOT DE SEÑALES - Sistema TEO (Estrategia P: cruce de OBV)
  Analiza SOL, ETH, BTC, BNB, XRP (futuros perpetuos Binance)
  cada 5 min y manda señales por Telegram con captura del chart.
 
- Sistema (1h, velas cerradas):
-   - Cruce EMA 9/21 en la dirección del trade
-   - Volumen > MA-20 (en la vela del cruce o la siguiente
-     si va en la misma dirección)
-   - Precio del lado correcto del VWAP (sesión UTC)
-   - Veto RSI: no long con RSI>70; no short con RSI<30
-     ni con RSI sobre su SMA-14
-   - Filtro 1D: ADX(14) > 20 y precio del lado correcto
-     de la EMA 50 diaria
+ Sistema (1h, velas cerradas) - ganador del walk-forward, con
+ ventaja positiva confirmada fuera de muestra en los 5 pares:
+   - OBV cruza por ENCIMA de su propia EMA-20 -> LONG
+   - OBV cruza por DEBAJO de su propia EMA-20 -> SHORT
+   - Filtro 1D: precio del lado correcto de la EMA 50 diaria
+   - SL: 1.5x ATR(14) | TP1: 1.5x ATR (parcial) | TP2: 2x ATR
 
  Modos:
    python bot_senales.py --test   -> manda mensaje de prueba
    python bot_senales.py --once   -> un escaneo y termina (GitHub Actions)
-   python bot_senales.py          -> loop continuo cada 15 min (VPS/Railway, ajustar sleep si se quiere 5 min)
+   python bot_senales.py          -> loop continuo cada 5 min (Railway/VPS)
 ============================================================
 """
 
@@ -29,6 +26,7 @@ import time
 import json
 import requests
 import pandas as pd
+import numpy as np
 from datetime import datetime, timezone, timedelta
 
 # ---------------- CONFIG ----------------
@@ -37,9 +35,8 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 PARES = ["SOLUSDT", "ETHUSDT", "BTCUSDT", "BNBUSDT", "XRPUSDT"]
 
-ADX_MIN        = 20     # filtro de rango en 1D
-RSI_VETO_LONG  = 70
-RSI_VETO_SHORT = 30
+MAKER_FEE_POR_LADO = 0.0002  # 0.02% - arancel maker Binance Futures USDT-M, usuario regular
+
 VENTANA_FRESCA_MIN = 16 # en modo --once: solo alerta si la vela cerró hace <16 min
 LOG_FILE   = "registro_senales.csv"
 STATE_FILE = "estado.json"
@@ -74,115 +71,70 @@ def traer_velas(par: str, intervalo: str, limite: int = 300) -> pd.DataFrame:
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
 
-def rsi(s: pd.Series, n: int = 14) -> pd.Series:
-    d = s.diff()
-    up = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    rs = up / dn.replace(0, 1e-10)
-    return 100 - 100 / (1 + rs)
-
-def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     h, l, c = df["high"], df["low"], df["close"]
-    up, dn = h.diff(), -l.diff()
-    plus_dm  = ((up > dn) & (up > 0)) * up
-    minus_dm = ((dn > up) & (dn > 0)) * dn
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/n, adjust=False).mean()
-    pdi = 100 * plus_dm.ewm(alpha=1/n, adjust=False).mean() / atr
-    mdi = 100 * minus_dm.ewm(alpha=1/n, adjust=False).mean() / atr
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, 1e-10)
-    return dx.ewm(alpha=1/n, adjust=False).mean()
+    return tr.ewm(alpha=1/n, adjust=False).mean()
 
-def vwap_sesion(df: pd.DataFrame):
-    """VWAP anclado a la sesión UTC + bandas de 1 y 2 desvíos (ponderados)."""
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    fecha = df.index.date
-    pv  = (tp * df["volume"]).groupby(fecha).cumsum()
-    vv  = df["volume"].groupby(fecha).cumsum().replace(0, 1e-10)
-    vwap = pv / vv
-    var = ((tp - vwap) ** 2 * df["volume"]).groupby(fecha).cumsum() / vv
-    sd = var ** 0.5
-    return vwap, sd
+def obv(df: pd.DataFrame) -> pd.Series:
+    direccion = np.sign(df["close"].diff()).fillna(0)
+    return (direccion * df["volume"]).cumsum()
 
 
 def analizar_par(par: str) -> dict | None:
-    """Devuelve dict con la señal si el sistema completo se alinea, si no None."""
+    """Devuelve dict con la señal si el sistema (Estrategia P) se alinea, si no None."""
     h1 = traer_velas(par, "1h", 300)
     d1 = traer_velas(par, "1d", 300)
     if len(h1) < 60 or len(d1) < 60:
         return None
 
-    # --- 1h ---
-    h1["ema9"], h1["ema21"] = ema(h1["close"], 9), ema(h1["close"], 21)
-    h1["volma"] = h1["volume"].rolling(20).mean()
-    h1["rsi"] = rsi(h1["close"]); h1["rsisma"] = h1["rsi"].rolling(14).mean()
-    h1["vwap"], h1["sd"] = vwap_sesion(h1)
+    # --- 1h: OBV y su EMA-20 (el gatillo) ---
+    h1["ema9"], h1["ema21"] = ema(h1["close"], 9), ema(h1["close"], 21)  # solo para el chart
+    h1["obv"] = obv(h1)
+    h1["obv_ema"] = ema(h1["obv"], 20)
+    h1["atr"] = atr(h1)
 
-    u, p = h1.iloc[-1], h1.iloc[-2]  # última cerrada y anterior
+    u, p = h1.iloc[-1], h1.iloc[-2]  # última vela cerrada y la anterior
 
-    cruce_arr_u = u.ema9 > u.ema21 and p.ema9 <= p.ema21
-    cruce_arr_p = p.ema9 > p.ema21 and h1.iloc[-3].ema9 <= h1.iloc[-3].ema21
-    cruce_abj_u = u.ema9 < u.ema21 and p.ema9 >= p.ema21
-    cruce_abj_p = p.ema9 < p.ema21 and h1.iloc[-3].ema9 >= h1.iloc[-3].ema21
+    cruce_arriba = u.obv > u.obv_ema and p.obv <= p.obv_ema
+    cruce_abajo  = u.obv < u.obv_ema and p.obv >= p.obv_ema
 
-    vol_ok = u.volume > u.volma
-    verde, roja = u.close > u.open, u.close < u.open
-
-    # cruce en la última vela con volumen, o en la anterior con
-    # confirmación de volumen posterior en la misma dirección
-    senal_long_1h  = (cruce_arr_u and vol_ok) or (cruce_arr_p and vol_ok and verde)
-    senal_short_1h = (cruce_abj_u and vol_ok) or (cruce_abj_p and vol_ok and roja)
-
-    # VWAP como juez de lado
-    senal_long_1h  = senal_long_1h  and u.close > u.vwap
-    senal_short_1h = senal_short_1h and u.close < u.vwap
-
-    # vetos RSI
-    if u.rsi > RSI_VETO_LONG:
-        senal_long_1h = False
-    if u.rsi < RSI_VETO_SHORT or u.rsi > u.rsisma:
-        senal_short_1h = False
-
-    if not (senal_long_1h or senal_short_1h):
-        return None
-
-    # --- filtro 1D ---
-    d1["ema50"], d1["ema200"] = ema(d1["close"], 50), ema(d1["close"], 200)
-    d1["adx"] = adx(d1)
+    # --- filtro 1D: tendencia (unico filtro extra de la Estrategia P) ---
+    d1["ema50"] = ema(d1["close"], 50)
     ud = d1.iloc[-1]
-    if ud.adx < ADX_MIN:
-        return None
-    if senal_long_1h and ud.close < ud.ema50:
-        return None
-    if senal_short_1h and ud.close > ud.ema50:
+
+    senal_long  = cruce_arriba and ud.close > ud.ema50
+    senal_short = cruce_abajo  and ud.close < ud.ema50
+
+    if not (senal_long or senal_short):
         return None
 
-    lado = "LONG" if senal_long_1h else "SHORT"
-    regimen = "alcista" if ud.ema50 > ud.ema200 else "bajista"
+    lado = "LONG" if senal_long else "SHORT"
 
-    # niveles sugeridos (bandas VWAP + swing de 12 velas)
+    # niveles por ATR (SL 1.5x, TP1 1.5x parcial, TP2 2x) - igual que en el backtest
+    riesgo = 1.5 * u.atr
+    if riesgo <= 0 or riesgo / u.close < 0.0005:
+        return None
     if lado == "LONG":
-        sl  = min(u.vwap - 2 * u.sd, h1["low"].iloc[-12:].min())
-        tp1, tp2 = u.vwap + u.sd, u.vwap + 2 * u.sd
+        sl, tp1, tp2 = u.close - riesgo, u.close + riesgo, u.close + 2.0 * u.atr
     else:
-        sl  = max(u.vwap + 2 * u.sd, h1["high"].iloc[-12:].max())
-        tp1, tp2 = u.vwap - u.sd, u.vwap - 2 * u.sd
+        sl, tp1, tp2 = u.close + riesgo, u.close - riesgo, u.close - 2.0 * u.atr
+    rr1 = abs(tp1 - u.close) / riesgo
+    rr2 = abs(tp2 - u.close) / riesgo
 
-    riesgo = abs(u.close - sl)
-    # si el precio ya superó las bandas, usar targets por múltiplos de R
-    margen = riesgo * 0.5
-    if lado == "LONG" and tp1 < u.close + margen:
-        tp1, tp2 = u.close + 1.5 * riesgo, u.close + 2.0 * riesgo
-    elif lado == "SHORT" and tp1 > u.close - margen:
-        tp1, tp2 = u.close - 1.5 * riesgo, u.close - 2.0 * riesgo
-    rr1 = abs(tp1 - u.close) / riesgo if riesgo > 0 else 0
-    rr2 = abs(tp2 - u.close) / riesgo if riesgo > 0 else 0
+    # --- ROI de cada nivel: % de movimiento de precio hasta ahi,
+    # neto de comision (ida + vuelta, tarifa maker) ---
+    comision_ida_vuelta_pct = 2 * MAKER_FEE_POR_LADO * 100  # en puntos porcentuales
+    signo = 1 if lado == "LONG" else -1
+    roi_sl  = signo * (sl  - u.close) / u.close * 100 - comision_ida_vuelta_pct
+    roi_tp1 = signo * (tp1 - u.close) / u.close * 100 - comision_ida_vuelta_pct
+    roi_tp2 = signo * (tp2 - u.close) / u.close * 100 - comision_ida_vuelta_pct
 
     return {
         "par": par, "lado": lado, "precio": u.close,
-        "vwap": u.vwap, "rsi": u.rsi, "vol_x": u.volume / u.volma,
-        "adx_1d": ud.adx, "regimen": regimen,
+        "obv_x_ema": (u.obv - u.obv_ema) / abs(u.obv_ema) if u.obv_ema != 0 else 0,
         "sl": sl, "tp1": tp1, "tp2": tp2, "rr1": rr1, "rr2": rr2,
+        "roi_sl": roi_sl, "roi_tp1": roi_tp1, "roi_tp2": roi_tp2,
         "cierre_vela": h1.iloc[-1]["close_time"], "df": h1,
     }
 
@@ -196,11 +148,8 @@ def generar_chart(s: dict) -> bytes:
     ap = [
         mpf.make_addplot(df["Ema9"],  color="#e74c3c", width=1),
         mpf.make_addplot(df["Ema21"], color="#f39c12", width=1),
-        mpf.make_addplot(df["Vwap"],  color="#3498db", width=1.6),
-        mpf.make_addplot(df["Vwap"] + df["Sd"],     color="#2ecc71", width=0.7, linestyle="--"),
-        mpf.make_addplot(df["Vwap"] - df["Sd"],     color="#2ecc71", width=0.7, linestyle="--"),
-        mpf.make_addplot(df["Vwap"] + 2 * df["Sd"], color="#e67e22", width=0.7, linestyle="--"),
-        mpf.make_addplot(df["Vwap"] - 2 * df["Sd"], color="#e67e22", width=0.7, linestyle="--"),
+        mpf.make_addplot(df["Obv"],     panel=2, color="#3498db", width=1.6, ylabel="OBV"),
+        mpf.make_addplot(df["Obv_ema"], panel=2, color="#e67e22", width=1),
     ]
     # marcador de señal en la última vela
     marca = pd.Series(float("nan"), index=df.index)
@@ -216,7 +165,8 @@ def generar_chart(s: dict) -> bytes:
     fig, _ = mpf.plot(
         df, type="candle", style=estilo, addplot=ap, volume=True,
         title=f"\n{s['par']} 1h - {s['lado']}",
-        returnfig=True, figsize=(12, 7), tight_layout=True,
+        returnfig=True, figsize=(12, 8), tight_layout=True,
+        panel_ratios=(3, 1, 1),
     )
     fig.savefig(buf, format="png", dpi=110, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
@@ -305,16 +255,18 @@ def procesar_comandos(estado: dict) -> dict:
 def armar_caption(s: dict) -> str:
     e = "\U0001F7E2" if s["lado"] == "LONG" else "\U0001F534"
     f = lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    fr = lambda x: f"{x:+.2f}".replace(".", ",")
     return (
-        f"{e} <b>{s['lado']} {s['par']}</b> | 1h\n"
-        f"Precio: {f(s['precio'])} | VWAP: {f(s['vwap'])}\n"
-        f"Vol: {s['vol_x']:.1f}x MA-20 | RSI: {s['rsi']:.0f}\n"
-        f"1D: ADX {s['adx_1d']:.0f} \u2713 | r\u00e9gimen {s['regimen']} (EMA 200/50)\n"
+        f"{e} <b>{s['lado']} {s['par']}</b> | 1h | Estrategia P (OBV)\n"
+        f"Precio: {f(s['precio'])}\n"
+        f"OBV vs su EMA-20: {s['obv_x_ema']*100:+.1f}%\n"
+        f"1D: tendencia confirmada (precio vs EMA50 diaria)\n"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"SL sugerido: {f(s['sl'])}\n"
-        f"TP1: {f(s['tp1'])} (RR 1:{s['rr1']:.1f}) | TP2: {f(s['tp2'])} (RR 1:{s['rr2']:.1f})\n"
-        f"\u26A0\uFE0F Esperar retest en 15m antes de entrar.\n"
-        f"Sin retest en 4 velas de 15m = trade cancelado."
+        f"SL:  {f(s['sl'])}  \u2192 ROI {fr(s['roi_sl'])}%\n"
+        f"TP1: {f(s['tp1'])}  \u2192 ROI {fr(s['roi_tp1'])}% (RR 1:{s['rr1']:.2f}, parcial 50%)\n"
+        f"TP2: {f(s['tp2'])}  \u2192 ROI {fr(s['roi_tp2'])}% (RR 1:{s['rr2']:.2f})\n"
+        f"<i>ROI = % de movimiento de precio, neto de comisi\u00f3n maker ida+vuelta (0,04%)</i>\n"
+        f"Entrada validada en backtest sin retest previo - pod\u00e9s ejecutar directo."
     )
 
 
@@ -325,13 +277,13 @@ def registrar(s: dict):
         w = csv.writer(fh)
         if nuevo:
             w.writerow(["fecha_utc", "par", "lado", "precio", "sl", "tp1", "tp2",
-                        "rr1", "rr2", "vol_x", "rsi", "adx_1d", "regimen_1d",
-                        "hubo_retest", "resultado_R"])
+                        "rr1", "rr2", "obv_x_ema", "roi_sl_pct", "roi_tp1_pct", "roi_tp2_pct",
+                        "resultado_R"])
         w.writerow([datetime.now(timezone.utc).isoformat(timespec="minutes"),
                     s["par"], s["lado"], round(s["precio"], 4), round(s["sl"], 4),
                     round(s["tp1"], 4), round(s["tp2"], 4), round(s["rr1"], 2),
-                    round(s["rr2"], 2), round(s["vol_x"], 2), round(s["rsi"], 1),
-                    round(s["adx_1d"], 1), s["regimen"], "", ""])
+                    round(s["rr2"], 2), round(s["obv_x_ema"], 4),
+                    round(s["roi_sl"], 3), round(s["roi_tp1"], 3), round(s["roi_tp2"], 3), ""])
 
 def cargar_estado() -> dict:
     if os.path.exists(STATE_FILE):
@@ -384,7 +336,7 @@ def main():
         sys.exit("Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en las variables de entorno.")
 
     if "--test" in sys.argv:
-        enviar_texto("\u2705 Bot de se\u00f1ales TEO conectado. Sistema: EMA 9/21 + Vol MA-20 + VWAP + veto RSI + filtro ADX 1D.\nPares: " + ", ".join(PARES))
+        enviar_texto("\u2705 Bot de se\u00f1ales TEO conectado. Sistema: Estrategia P (cruce de OBV + filtro de tendencia 1D).\nPares: " + ", ".join(PARES))
         print("Mensaje de prueba enviado.")
         return
 
