@@ -43,6 +43,7 @@ jobs:
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           [ -f registro_senales.csv ] && git add registro_senales.csv
+          [ -f registro_divergencias.csv ] && git add registro_divergencias.csv
           [ -f estado.json ] && git add estado.json
           if git diff --cached --quiet; then
             echo "Nada nuevo para guardar."
