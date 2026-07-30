@@ -216,6 +216,52 @@ def detectar_niveles(df: pd.DataFrame, tf: str) -> list[dict]:
     return agrupar(candidatos_res, "resistencia") + agrupar(candidatos_sop, "soporte")
 
 
+def generar_chart_nivel(par: str, tf: str, df: pd.DataFrame, nivel: dict) -> bytes:
+    """Chart de velas con la linea horizontal del soporte/resistencia marcada."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    d = df.iloc[-120:].copy().reset_index()
+    n = len(d)
+    color_up, color_down = "#26a69a", "#ef5350"
+
+    fig, ax = plt.subplots(figsize=(12, 6.5), facecolor="#131722")
+    ax.set_facecolor("#131722")
+    ax.tick_params(colors="#d1d4dc", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#2a2e39")
+
+    for i in range(n):
+        o, h, l, c = d["open"].iloc[i], d["high"].iloc[i], d["low"].iloc[i], d["close"].iloc[i]
+        color = color_up if c >= o else color_down
+        ax.plot([i, i], [l, h], color=color, linewidth=1)
+        ax.add_patch(Rectangle((i - 0.3, min(o, c)), 0.6, max(abs(c - o), 1e-9),
+                                facecolor=color, edgecolor=color))
+
+    col_nivel = "#ef5350" if nivel["tipo"] == "resistencia" else "#26a69a"
+    ax.axhline(nivel["precio"], color=col_nivel, linewidth=1.6, linestyle="--")
+    f = lambda x: f"{x:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    ax.annotate(f"{nivel['tipo'].upper()}  {f(nivel['precio'])}  ({nivel['toques']} toques)",
+                xy=(n - 1, nivel["precio"]), xytext=(n - 1, nivel["precio"]),
+                color=col_nivel, fontsize=10, fontweight="bold",
+                xycoords="data", textcoords="data", ha="right",
+                va="bottom" if nivel["tipo"] == "resistencia" else "top")
+
+    precio_actual = d["close"].iloc[-1]
+    ax.plot(n - 1, precio_actual, marker="o", markersize=6, color="#ffd54f")
+
+    ax.set_title(f"{par}  {tf.upper()}  -  Acercandose a {nivel['tipo'].upper()}",
+                 color="#d1d4dc", fontsize=12, loc="left")
+    ax.set_xlim(-2, n + 1)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
 def revisar_proximidad(par: str, tf: str, df: pd.DataFrame, estado: dict, ahora: datetime) -> dict:
     """Avisa si el precio actual esta cerca de un soporte/resistencia
     de esa temporalidad. Usa cooldown para no repetir el mismo aviso."""
@@ -253,7 +299,8 @@ def revisar_proximidad(par: str, tf: str, df: pd.DataFrame, estado: dict, ahora:
             f"\U0001F550 {a_hora_art(ahora)} ART"
         )
         try:
-            enviar_texto(msg)
+            png = generar_chart_nivel(par, tf, df, nivel)
+            enviar_foto(msg, png)
             estado[clave] = ahora.isoformat()
             registrar_nivel(par, tf, nivel, precio_actual, rsi_actual, ahora)
         except Exception as ex:
