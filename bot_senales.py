@@ -1,20 +1,18 @@
 """
 ============================================================
- BOT DE SEÑALES - Sistema TEO (Estrategia P: cruce de OBV)
+ BOT DE SEÑALES - Detector de Divergencias RSI (Sistema TEO)
  Analiza SOL, ETH, BTC, BNB, XRP (futuros perpetuos Binance)
- cada 5 min y manda señales por Telegram con captura del chart.
+ cada 5 min y manda por Telegram las divergencias de RSI(14)
+ que se van confirmando, con foto del chart de la temporalidad
+ correspondiente y aviso de si el sesgo es LONG o SHORT.
 
- Sistema (1h, velas cerradas) - ganador del walk-forward, con
- ventaja positiva confirmada fuera de muestra en los 5 pares:
-   - OBV cruza por ENCIMA de su propia EMA-20 -> LONG
-   - OBV cruza por DEBAJO de su propia EMA-20 -> SHORT
-   - Filtro 1D: precio del lado correcto de la EMA 50 diaria
-   - SL: 1.5x ATR(14) | TP1: 1.5x ATR (parcial) | TP2: 2x ATR
+ Temporalidades escaneadas: 1m, 1h, 4h, 1d
+   - Divergencia ALCISTA de RSI  -> sesgo LONG
+   - Divergencia BAJISTA de RSI  -> sesgo SHORT
 
- Ademas (modulo aparte, no altera la Estrategia P):
-   - Deteccion de divergencias regulares de RSI(14) en 1D, 4H y 1H
-   - Manda chart de la temporalidad donde se detecto, con los dos
-     pivots marcados en precio y en el panel de RSI
+ NOTA: 1m esta pensado para TESTEAR que el bot funciona end-to-end.
+ Para operar en serio conviene mirar 1h/4h/1d, ya que en 1m el
+ ruido genera muchas divergencias que no son operables.
 
  Modos:
    python bot_senales.py --test   -> manda mensaje de prueba
@@ -40,21 +38,20 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 PARES = ["SOLUSDT", "ETHUSDT", "BTCUSDT", "BNBUSDT", "XRPUSDT"]
 
-MAKER_FEE_POR_LADO = 0.0002  # 0.02% - arancel maker Binance Futures USDT-M, usuario regular
-
-VENTANA_FRESCA_MIN = 16 # en modo --once: solo alerta si la vela cerró hace <16 min
-LOG_FILE   = "registro_senales.csv"
 STATE_FILE = "estado.json"
 
-# --- Config del modulo de divergencias RSI ---
+# --- Config del detector de divergencias RSI ---
 DIV_LOG_FILE   = "registro_divergencias.csv"
-DIV_TIMEFRAMES = ["1d", "4h", "1h"]  # orden de escaneo
+DIV_TIMEFRAMES = ["1m", "1h", "4h", "1d"]  # orden de escaneo
 DIV_RSI_LEN    = 14
 DIV_SMA_LEN    = 14
 DIV_LB_LEFT    = 5
 DIV_LB_RIGHT   = 5     # velas de confirmacion del pivot (retraso inevitable)
 DIV_RANGE_MIN  = 5     # separacion minima entre pivots, en barras
 DIV_RANGE_MAX  = 60    # separacion maxima entre pivots, en barras
+
+# ventana de frescura por temporalidad, para modo --once (GitHub Actions)
+DIV_VENTANA_FRESCA_MIN = {"1m": 6, "1h": 16, "4h": 60, "1d": 180}
 
 # Espejo publico de datos de Binance, sin restriccion geografica
 # (fapi.binance.com bloquea IPs de EEUU con error 451; este endpoint
@@ -83,18 +80,6 @@ def traer_velas(par: str, intervalo: str, limite: int = 300) -> pd.DataFrame:
 
 
 # ---------------- INDICADORES ----------------
-def ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean()
-
-def obv(df: pd.DataFrame) -> pd.Series:
-    direccion = np.sign(df["close"].diff()).fillna(0)
-    return (direccion * df["volume"]).cumsum()
-
 def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     delta = s.diff()
     ganancia = delta.clip(lower=0)
@@ -106,65 +91,7 @@ def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     return r.fillna(50)
 
 
-def analizar_par(par: str) -> dict | None:
-    """Devuelve dict con la señal si el sistema (Estrategia P) se alinea, si no None."""
-    h1 = traer_velas(par, "1h", 300)
-    d1 = traer_velas(par, "1d", 300)
-    if len(h1) < 60 or len(d1) < 60:
-        return None
-
-    # --- 1h: OBV y su EMA-20 (el gatillo) ---
-    h1["ema9"], h1["ema21"] = ema(h1["close"], 9), ema(h1["close"], 21)  # solo para el chart
-    h1["obv"] = obv(h1)
-    h1["obv_ema"] = ema(h1["obv"], 20)
-    h1["atr"] = atr(h1)
-
-    u, p = h1.iloc[-1], h1.iloc[-2]  # última vela cerrada y la anterior
-
-    cruce_arriba = u.obv > u.obv_ema and p.obv <= p.obv_ema
-    cruce_abajo  = u.obv < u.obv_ema and p.obv >= p.obv_ema
-
-    # --- filtro 1D: tendencia (unico filtro extra de la Estrategia P) ---
-    d1["ema50"] = ema(d1["close"], 50)
-    ud = d1.iloc[-1]
-
-    senal_long  = cruce_arriba and ud.close > ud.ema50
-    senal_short = cruce_abajo  and ud.close < ud.ema50
-
-    if not (senal_long or senal_short):
-        return None
-
-    lado = "LONG" if senal_long else "SHORT"
-
-    # niveles por ATR (SL 1.5x, TP1 1.5x parcial, TP2 2x) - igual que en el backtest
-    riesgo = 1.5 * u.atr
-    if riesgo <= 0 or riesgo / u.close < 0.0005:
-        return None
-    if lado == "LONG":
-        sl, tp1, tp2 = u.close - riesgo, u.close + riesgo, u.close + 2.0 * u.atr
-    else:
-        sl, tp1, tp2 = u.close + riesgo, u.close - riesgo, u.close - 2.0 * u.atr
-    rr1 = abs(tp1 - u.close) / riesgo
-    rr2 = abs(tp2 - u.close) / riesgo
-
-    # --- ROI de cada nivel: % de movimiento de precio hasta ahi,
-    # neto de comision (ida + vuelta, tarifa maker) ---
-    comision_ida_vuelta_pct = 2 * MAKER_FEE_POR_LADO * 100  # en puntos porcentuales
-    signo = 1 if lado == "LONG" else -1
-    roi_sl  = signo * (sl  - u.close) / u.close * 100 - comision_ida_vuelta_pct
-    roi_tp1 = signo * (tp1 - u.close) / u.close * 100 - comision_ida_vuelta_pct
-    roi_tp2 = signo * (tp2 - u.close) / u.close * 100 - comision_ida_vuelta_pct
-
-    return {
-        "par": par, "lado": lado, "precio": u.close,
-        "obv_x_ema": (u.obv - u.obv_ema) / abs(u.obv_ema) if u.obv_ema != 0 else 0,
-        "sl": sl, "tp1": tp1, "tp2": tp2, "rr1": rr1, "rr2": rr2,
-        "roi_sl": roi_sl, "roi_tp1": roi_tp1, "roi_tp2": roi_tp2,
-        "cierre_vela": h1.iloc[-1]["close_time"], "df": h1,
-    }
-
-
-# ---------------- MODULO: DIVERGENCIAS RSI (1D / 4H / 1H) ----------------
+# ---------------- MODULO: DIVERGENCIAS RSI (1M / 1H / 4H / 1D) ----------------
 def _pivots(serie: pd.Series, lb_left: int, lb_right: int):
     """
     Pivots locales de una serie (usado sobre el RSI).
@@ -206,7 +133,7 @@ def detectar_divergencia_tf(df: pd.DataFrame) -> dict | None:
 
     resultado = None
 
-    # --- pivot low en idx_confirma: buscar divergencia alcista ---
+    # --- pivot low en idx_confirma: buscar divergencia alcista (sesgo LONG) ---
     if pl[idx_confirma]:
         anteriores = [i for i in range(0, idx_confirma) if pl[i]]
         if anteriores:
@@ -217,13 +144,14 @@ def detectar_divergencia_tf(df: pd.DataFrame) -> dict | None:
                 rsi_now, rsi_prev = df["rsi"].iloc[idx_confirma], df["rsi"].iloc[prev]
                 if precio_now < precio_prev and rsi_now > rsi_prev:
                     resultado = {
-                        "tipo": "alcista", "idx_a": prev, "idx_b": idx_confirma,
+                        "tipo": "alcista", "sesgo": "LONG",
+                        "idx_a": prev, "idx_b": idx_confirma,
                         "precio_a": precio_prev, "precio_b": precio_now,
                         "rsi_a": rsi_prev, "rsi_b": rsi_now,
                         "vela_confirma": df.iloc[idx_confirma]["close_time"],
                     }
 
-    # --- pivot high en idx_confirma: buscar divergencia bajista ---
+    # --- pivot high en idx_confirma: buscar divergencia bajista (sesgo SHORT) ---
     if resultado is None and ph[idx_confirma]:
         anteriores = [i for i in range(0, idx_confirma) if ph[i]]
         if anteriores:
@@ -234,7 +162,8 @@ def detectar_divergencia_tf(df: pd.DataFrame) -> dict | None:
                 rsi_now, rsi_prev = df["rsi"].iloc[idx_confirma], df["rsi"].iloc[prev]
                 if precio_now > precio_prev and rsi_now < rsi_prev:
                     resultado = {
-                        "tipo": "bajista", "idx_a": prev, "idx_b": idx_confirma,
+                        "tipo": "bajista", "sesgo": "SHORT",
+                        "idx_a": prev, "idx_b": idx_confirma,
                         "precio_a": precio_prev, "precio_b": precio_now,
                         "rsi_a": rsi_prev, "rsi_b": rsi_now,
                         "vela_confirma": df.iloc[idx_confirma]["close_time"],
@@ -248,7 +177,7 @@ def detectar_divergencia_tf(df: pd.DataFrame) -> dict | None:
 
 
 def analizar_divergencias(par: str) -> list[dict]:
-    """Escanea 1D, 4H y 1H. Devuelve lista de divergencias recien confirmadas."""
+    """Escanea 1m, 1H, 4H y 1D. Devuelve lista de divergencias recien confirmadas."""
     encontradas = []
     for tf in DIV_TIMEFRAMES:
         try:
@@ -270,7 +199,6 @@ def generar_chart_divergencia(div: dict) -> bytes:
     """Chart con panel de precio (velas) y panel de RSI, marcando los dos
     pivots de la divergencia y la linea que los conecta en ambos paneles."""
     import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
     from matplotlib.patches import Rectangle
 
     df = div["df"].iloc[-120:].copy()
@@ -316,14 +244,14 @@ def generar_chart_divergencia(div: dict) -> bytes:
     ax_rsi.plot(xs, rsi_puntos, color=col_div, linewidth=2, marker="o", markersize=5)
 
     marca = "▲" if div["tipo"] == "alcista" else "▼"
-    ax_price.annotate(f"{marca} Div. {div['tipo']}",
+    ax_price.annotate(f"{marca} {div['sesgo']}",
                        xy=(idx_b, precio_puntos[1]),
                        xytext=(idx_b, precio_puntos[1]),
-                       color=col_div, fontsize=10, fontweight="bold",
+                       color=col_div, fontsize=11, fontweight="bold",
                        xycoords="data", textcoords="data",
                        ha="right", va="bottom" if div["tipo"] == "alcista" else "top")
 
-    ax_price.set_title(f"{div['par']}  {div['tf'].upper()}  -  Divergencia {div['tipo'].upper()} de RSI",
+    ax_price.set_title(f"{div['par']}  {div['tf'].upper()}  -  Divergencia {div['tipo'].upper()} de RSI  ->  {div['sesgo']}",
                         color="#d1d4dc", fontsize=12, loc="left")
     ax_price.set_xlim(-2, n + 1)
     ax_rsi.set_xlim(-2, n + 1)
@@ -337,11 +265,12 @@ def generar_chart_divergencia(div: dict) -> bytes:
 
 
 def armar_caption_divergencia(div: dict) -> str:
-    e = "\U0001F7E2" if div["tipo"] == "alcista" else "\U0001F534"
+    emoji_sesgo = "\U0001F7E2" if div["sesgo"] == "LONG" else "\U0001F534"
+    flecha = "\U0001F53C" if div["sesgo"] == "LONG" else "\U0001F53D"
     f = lambda x: f"{x:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return (
-        f"{e} <b>Divergencia {div['tipo'].upper()} de RSI</b>\n"
-        f"{div['par']} | {div['tf'].upper()}\n"
+        f"{emoji_sesgo} <b>{div['par']}</b> | {div['tf'].upper()}\n"
+        f"{flecha} <b>Divergencia {div['tipo'].upper()} de RSI -> sesgo {div['sesgo']}</b>\n"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"Pivot anterior: precio {f(div['precio_a'])} | RSI {div['rsi_a']:.1f}\n"
         f"Pivot actual:   precio {f(div['precio_b'])} | RSI {div['rsi_b']:.1f}\n"
@@ -357,10 +286,10 @@ def registrar_divergencia(div: dict):
     with open(DIV_LOG_FILE, "a", newline="") as fh:
         w = csv.writer(fh)
         if nuevo:
-            w.writerow(["fecha_utc", "par", "tf", "tipo", "precio_a", "precio_b",
+            w.writerow(["fecha_utc", "par", "tf", "tipo", "sesgo", "precio_a", "precio_b",
                         "rsi_a", "rsi_b"])
         w.writerow([datetime.now(timezone.utc).isoformat(timespec="minutes"),
-                    div["par"], div["tf"], div["tipo"],
+                    div["par"], div["tf"], div["tipo"], div["sesgo"],
                     round(div["precio_a"], 6), round(div["precio_b"], 6),
                     round(div["rsi_a"], 2), round(div["rsi_b"], 2)])
 
@@ -381,12 +310,11 @@ def escanear_divergencias(estado: dict, modo_once: bool) -> dict:
 
             if modo_once:
                 mins = (ahora - div["vela_confirma"]).total_seconds() / 60
-                # ventanas de frescura mas laxas en TFs altos, porque la vela dura mas
-                ventana = {"1h": 16, "4h": 60, "1d": 180}.get(div["tf"], VENTANA_FRESCA_MIN)
+                ventana = DIV_VENTANA_FRESCA_MIN.get(div["tf"], 16)
                 if mins > ventana:
                     continue
 
-            print(f"[{par}][{div['tf']}] divergencia {div['tipo']} -> enviando")
+            print(f"[{par}][{div['tf']}] divergencia {div['tipo']} ({div['sesgo']}) -> enviando")
             try:
                 enviar_foto(armar_caption_divergencia(div), generar_chart_divergencia(div))
                 registrar_divergencia(div)
@@ -394,43 +322,6 @@ def escanear_divergencias(estado: dict, modo_once: bool) -> dict:
             except Exception as ex:
                 print(f"[{par}][{div['tf']}] error enviando divergencia: {ex}")
     return estado
-
-
-# ---------------- CHART (Estrategia P) ----------------
-def generar_chart(s: dict) -> bytes:
-    import mplfinance as mpf
-    df = s["df"].iloc[-100:].copy()
-    df.columns = [c.capitalize() for c in df.columns]
-
-    ap = [
-        mpf.make_addplot(df["Ema9"],  color="#e74c3c", width=1),
-        mpf.make_addplot(df["Ema21"], color="#f39c12", width=1),
-        mpf.make_addplot(df["Obv"],     panel=2, color="#3498db", width=1.6, ylabel="OBV"),
-        mpf.make_addplot(df["Obv_ema"], panel=2, color="#e67e22", width=1),
-    ]
-    # marcador de señal en la última vela
-    marca = pd.Series(float("nan"), index=df.index)
-    if s["lado"] == "LONG":
-        marca.iloc[-1] = df["Low"].iloc[-1] * 0.998
-        ap.append(mpf.make_addplot(marca, type="scatter", marker="^", markersize=140, color="#2ecc71"))
-    else:
-        marca.iloc[-1] = df["High"].iloc[-1] * 1.002
-        ap.append(mpf.make_addplot(marca, type="scatter", marker="v", markersize=140, color="#e74c3c"))
-
-    estilo = mpf.make_mpf_style(base_mpf_style="nightclouds", gridstyle=":")
-    buf = io.BytesIO()
-    fig, _ = mpf.plot(
-        df, type="candle", style=estilo, addplot=ap, volume=True,
-        title=f"\n{s['par']} 1h - {s['lado']}",
-        returnfig=True, figsize=(12, 8), tight_layout=True,
-        panel_ratios=(3, 1, 1),
-    )
-    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    import matplotlib.pyplot as plt
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
 
 
 # ---------------- TELEGRAM ----------------
@@ -457,33 +348,29 @@ def telegram_get(metodo: str, params: dict) -> dict:
 def responder_estado(comando: str):
     if comando in ("/start", "/ayuda", "/help"):
         enviar_texto(
-            "\U0001F916 Bot de se\u00f1ales TEO\n\n"
+            "\U0001F916 Bot de divergencias RSI - TEO\n\n"
             "Comandos:\n"
-            "/hoy o /estado - estado actual de los 5 pares\n\n"
-            "Las se\u00f1ales v\u00e1lidas te llegan solas, con chart, apenas se detectan "
-            "(chequeo autom\u00e1tico cada ~5 min). Tambien te avisamos divergencias de RSI "
-            "en 1D/4H/1H apenas se confirman."
+            "/hoy o /estado - ultimas divergencias detectadas hoy\n\n"
+            "Escaneo automatico cada ~5 min en 1m/1h/4h/1d para "
+            "SOL, ETH, BTC, BNB y XRP. Te llega el chart con la "
+            "divergencia marcada y el sesgo (LONG/SHORT)."
         )
         return
 
     ahora = (datetime.now(timezone.utc) + timedelta(hours=-3)).strftime("%H:%M")
-    lineas = [f"\U0001F4CA <b>Estado actual</b> ({ahora} ART)"]
-    alguna = False
-    for par in PARES:
-        try:
-            s = analizar_par(par)
-        except Exception as ex:
-            lineas.append(f"\u26AA {par}: error consultando ({ex})")
-            continue
-        if s:
-            alguna = True
-            e = "\U0001F7E2" if s["lado"] == "LONG" else "\U0001F534"
-            lineas.append(f"{e} {par}: SE\u00d1AL {s['lado']} (te llega la captura aparte)")
+    lineas = [f"\U0001F4CA <b>Divergencias detectadas hoy</b> ({ahora} ART)"]
+    if os.path.exists(DIV_LOG_FILE):
+        hoy = datetime.now(timezone.utc).date().isoformat()
+        with open(DIV_LOG_FILE) as fh:
+            filas = [r for r in csv.DictReader(fh) if r["fecha_utc"].startswith(hoy)]
+        if filas:
+            for r in filas[-15:]:
+                e = "\U0001F7E2" if r["sesgo"] == "LONG" else "\U0001F534"
+                lineas.append(f"{e} {r['par']} {r['tf'].upper()} - {r['sesgo']} ({r['fecha_utc'][11:16]} UTC)")
         else:
-            lineas.append(f"\u26AA {par}: sin se\u00f1al")
-    lineas.append("" )
-    lineas.append("Hay se\u00f1al activa \u2192 revis\u00e1 el mensaje con el chart." if alguna
-                   else "Ninguno cumple los filtros ahora mismo. Reintento autom\u00e1tico en ~5 min.")
+            lineas.append("Todavia ninguna divergencia detectada hoy.")
+    else:
+        lineas.append("Todavia no hay registro de divergencias.")
     enviar_texto("\n".join(lineas))
 
 
@@ -510,39 +397,8 @@ def procesar_comandos(estado: dict) -> dict:
             print(f"error respondiendo comando: {ex}")
     return estado
 
-def armar_caption(s: dict) -> str:
-    e = "\U0001F7E2" if s["lado"] == "LONG" else "\U0001F534"
-    f = lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    fr = lambda x: f"{x:+.2f}".replace(".", ",")
-    return (
-        f"{e} <b>{s['lado']} {s['par']}</b> | 1h | Estrategia P (OBV)\n"
-        f"Precio: {f(s['precio'])}\n"
-        f"OBV vs su EMA-20: {s['obv_x_ema']*100:+.1f}%\n"
-        f"1D: tendencia confirmada (precio vs EMA50 diaria)\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"SL:  {f(s['sl'])}  \u2192 ROI {fr(s['roi_sl'])}%\n"
-        f"TP1: {f(s['tp1'])}  \u2192 ROI {fr(s['roi_tp1'])}% (RR 1:{s['rr1']:.2f}, parcial 50%)\n"
-        f"TP2: {f(s['tp2'])}  \u2192 ROI {fr(s['roi_tp2'])}% (RR 1:{s['rr2']:.2f})\n"
-        f"<i>ROI = % de movimiento de precio, neto de comisi\u00f3n maker ida+vuelta (0,04%)</i>\n"
-        f"Entrada validada en backtest sin retest previo - pod\u00e9s ejecutar directo."
-    )
 
-
-# ---------------- REGISTRO / ESTADO ----------------
-def registrar(s: dict):
-    nuevo = not os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as fh:
-        w = csv.writer(fh)
-        if nuevo:
-            w.writerow(["fecha_utc", "par", "lado", "precio", "sl", "tp1", "tp2",
-                        "rr1", "rr2", "obv_x_ema", "roi_sl_pct", "roi_tp1_pct", "roi_tp2_pct",
-                        "resultado_R"])
-        w.writerow([datetime.now(timezone.utc).isoformat(timespec="minutes"),
-                    s["par"], s["lado"], round(s["precio"], 4), round(s["sl"], 4),
-                    round(s["tp1"], 4), round(s["tp2"], 4), round(s["rr1"], 2),
-                    round(s["rr2"], 2), round(s["obv_x_ema"], 4),
-                    round(s["roi_sl"], 3), round(s["roi_tp1"], 3), round(s["roi_tp2"], 3), ""])
-
+# ---------------- ESTADO ----------------
 def cargar_estado() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as fh:
@@ -557,39 +413,7 @@ def guardar_estado(e: dict):
 # ---------------- CICLO ----------------
 def escanear(modo_once: bool):
     estado = cargar_estado()
-    ahora = datetime.now(timezone.utc)
-    for par in PARES:
-        try:
-            s = analizar_par(par)
-        except Exception as ex:
-            print(f"[{par}] error: {ex}")
-            continue
-        if s is None:
-            print(f"[{par}] sin se\u00f1al")
-            continue
-
-        clave = f"{par}_{s['cierre_vela'].isoformat()}"
-        if estado.get(par) == clave:
-            print(f"[{par}] se\u00f1al ya enviada")
-            continue
-        # en modo --once (sin estado persistente) solo alertar velas frescas
-        if modo_once:
-            mins = (ahora - s["cierre_vela"]).total_seconds() / 60
-            if mins > VENTANA_FRESCA_MIN:
-                print(f"[{par}] se\u00f1al vieja ({mins:.0f} min), se omite")
-                continue
-
-        print(f"[{par}] SE\u00d1AL {s['lado']} -> enviando")
-        try:
-            enviar_foto(armar_caption(s), generar_chart(s))
-            registrar(s)
-            estado[par] = clave
-        except Exception as ex:
-            print(f"[{par}] error enviando: {ex}")
-
-    # --- modulo de divergencias RSI (1D/4H/1H), independiente de la Estrategia P ---
     estado = escanear_divergencias(estado, modo_once)
-
     guardar_estado(estado)
 
 
@@ -598,8 +422,8 @@ def main():
         sys.exit("Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en las variables de entorno.")
 
     if "--test" in sys.argv:
-        enviar_texto("\u2705 Bot de se\u00f1ales TEO conectado. Sistema: Estrategia P (cruce de OBV + filtro de tendencia 1D) "
-                     "+ deteccion de divergencias RSI en 1D/4H/1H.\nPares: " + ", ".join(PARES))
+        enviar_texto("\u2705 Bot de divergencias RSI conectado. "
+                     "Escaneando 1m/1h/4h/1d en: " + ", ".join(PARES))
         print("Mensaje de prueba enviado.")
         return
 
@@ -614,7 +438,6 @@ def main():
     # y escanea los pares cada 5 minutos
     print("Bot iniciado en modo loop.")
     ultimo_escaneo = 0.0
-    ultimo_resumen_dia = ""
     while True:
         estado = cargar_estado()
         estado = procesar_comandos(estado)
@@ -625,19 +448,7 @@ def main():
             escanear(modo_once=False)
             ultimo_escaneo = ahora_ts
 
-            ahora = datetime.now(timezone.utc)
-            if ahora.hour == 17 and ahora.minute < 5:  # 14:00 ART
-                hoy = ahora.date().isoformat()
-                if ultimo_resumen_dia != hoy:
-                    est = cargar_estado()
-                    enviadas_hoy = any(hoy in str(v) for k, v in est.items()
-                                        if k not in ("resumen", "update_offset"))
-                    if not enviadas_hoy:
-                        enviar_texto("\U0001F4CB 14:00 ART - Sesi\u00f3n sin se\u00f1ales v\u00e1lidas. "
-                                     "Sesi\u00f3n cerrada seg\u00fan regla. D\u00eda de replay/backtesting.")
-                    ultimo_resumen_dia = hoy
-
-        time.sleep(10)  # chequeo de comandos, casi instant\u00e1neo
+        time.sleep(10)  # chequeo de comandos, casi instantaneo
 
 
 if __name__ == "__main__":
