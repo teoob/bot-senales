@@ -6,13 +6,9 @@
  que se van confirmando, con foto del chart de la temporalidad
  correspondiente y aviso de si el sesgo es LONG o SHORT.
 
- Temporalidades escaneadas: 1m, 1h, 4h, 1d
+ Temporalidades escaneadas: 1h, 4h, 1d
    - Divergencia ALCISTA de RSI  -> sesgo LONG
    - Divergencia BAJISTA de RSI  -> sesgo SHORT
-
- NOTA: 1m esta pensado para TESTEAR que el bot funciona end-to-end.
- Para operar en serio conviene mirar 1h/4h/1d, ya que en 1m el
- ruido genera muchas divergencias que no son operables.
 
  Modos:
    python bot_senales.py --test   -> manda mensaje de prueba
@@ -42,7 +38,7 @@ STATE_FILE = "estado.json"
 
 # --- Config del detector de divergencias RSI ---
 DIV_LOG_FILE   = "registro_divergencias.csv"
-DIV_TIMEFRAMES = ["1m", "1h", "4h", "1d"]  # orden de escaneo
+DIV_TIMEFRAMES = ["1h", "4h", "1d"]  # orden de escaneo
 DIV_RSI_LEN    = 14
 DIV_SMA_LEN    = 14
 DIV_LB_LEFT    = 5
@@ -51,7 +47,7 @@ DIV_RANGE_MIN  = 5     # separacion minima entre pivots, en barras
 DIV_RANGE_MAX  = 60    # separacion maxima entre pivots, en barras
 
 # ventana de frescura por temporalidad, para modo --once (GitHub Actions)
-DIV_VENTANA_FRESCA_MIN = {"1m": 6, "1h": 16, "4h": 60, "1d": 180}
+DIV_VENTANA_FRESCA_MIN = {"1h": 16, "4h": 60, "1d": 180}
 
 # Espejo publico de datos de Binance, sin restriccion geografica
 # (fapi.binance.com bloquea IPs de EEUU con error 451; este endpoint
@@ -113,67 +109,72 @@ def _pivots(serie: pd.Series, lb_left: int, lb_right: int):
     return ph, pl
 
 
-def detectar_divergencia_tf(df: pd.DataFrame) -> dict | None:
+def detectar_divergencias_tf(df: pd.DataFrame, ventana_reciente: int = 10) -> list[dict]:
     """
-    Busca, en la ULTIMA barra donde ya se puede confirmar un pivot
-    (posicion len-1-lb_right), si hay una divergencia regular de RSI
-    contra el pivot anterior del mismo tipo.
+    Busca divergencias regulares de RSI confirmadas en las ultimas
+    `ventana_reciente` barras confirmables (no solo la ultima).
 
-    Devuelve None si no hay divergencia recien confirmada en esa barra,
-    o un dict con los datos para armar el mensaje y el chart.
+    Esto es necesario porque el bot escanea cada 5 min, pero en
+    temporalidades rapidas (ej. 1m) pueden confirmarse varios pivots
+    entre corrida y corrida -- si solo revisaramos la ultima barra
+    confirmable, se perderian las demas.
+
+    Devuelve una lista (puede tener 0, 1, o varias divergencias),
+    cada una con su propia 'vela_confirma' para deduplicar en el estado.
     """
     df = df.copy()
     df["rsi"] = rsi(df["close"], DIV_RSI_LEN)
     n = len(df)
-    idx_confirma = n - 1 - DIV_LB_RIGHT  # ultima posicion con pivot ya confirmable
-    if idx_confirma < DIV_LB_LEFT + DIV_RANGE_MIN:
-        return None
+    ultima_confirmable = n - 1 - DIV_LB_RIGHT  # ultima posicion con pivot ya confirmable
+    if ultima_confirmable < DIV_LB_LEFT + DIV_RANGE_MIN:
+        return []
 
     ph, pl = _pivots(df["rsi"], DIV_LB_LEFT, DIV_LB_RIGHT)
 
-    resultado = None
+    desde = max(DIV_LB_LEFT, ultima_confirmable - ventana_reciente + 1)
+    resultados = []
 
-    # --- pivot low en idx_confirma: buscar divergencia alcista (sesgo LONG) ---
-    if pl[idx_confirma]:
-        anteriores = [i for i in range(0, idx_confirma) if pl[i]]
-        if anteriores:
-            prev = anteriores[-1]
-            gap = idx_confirma - prev
-            if DIV_RANGE_MIN <= gap <= DIV_RANGE_MAX:
-                precio_now, precio_prev = df["low"].iloc[idx_confirma], df["low"].iloc[prev]
-                rsi_now, rsi_prev = df["rsi"].iloc[idx_confirma], df["rsi"].iloc[prev]
-                if precio_now < precio_prev and rsi_now > rsi_prev:
-                    resultado = {
-                        "tipo": "alcista", "sesgo": "LONG",
-                        "idx_a": prev, "idx_b": idx_confirma,
-                        "precio_a": precio_prev, "precio_b": precio_now,
-                        "rsi_a": rsi_prev, "rsi_b": rsi_now,
-                        "vela_confirma": df.iloc[idx_confirma]["close_time"],
-                    }
+    for idx_confirma in range(desde, ultima_confirmable + 1):
+        # --- pivot low en idx_confirma: divergencia alcista (sesgo LONG) ---
+        if pl[idx_confirma]:
+            anteriores = [i for i in range(0, idx_confirma) if pl[i]]
+            if anteriores:
+                prev = anteriores[-1]
+                gap = idx_confirma - prev
+                if DIV_RANGE_MIN <= gap <= DIV_RANGE_MAX:
+                    precio_now, precio_prev = df["low"].iloc[idx_confirma], df["low"].iloc[prev]
+                    rsi_now, rsi_prev = df["rsi"].iloc[idx_confirma], df["rsi"].iloc[prev]
+                    if precio_now < precio_prev and rsi_now > rsi_prev:
+                        resultados.append({
+                            "tipo": "alcista", "sesgo": "LONG",
+                            "idx_a": prev, "idx_b": idx_confirma,
+                            "precio_a": precio_prev, "precio_b": precio_now,
+                            "rsi_a": rsi_prev, "rsi_b": rsi_now,
+                            "vela_confirma": df.iloc[idx_confirma]["close_time"],
+                            "df": df,
+                        })
+                        continue  # no chequear tambien pivot high en la misma barra
 
-    # --- pivot high en idx_confirma: buscar divergencia bajista (sesgo SHORT) ---
-    if resultado is None and ph[idx_confirma]:
-        anteriores = [i for i in range(0, idx_confirma) if ph[i]]
-        if anteriores:
-            prev = anteriores[-1]
-            gap = idx_confirma - prev
-            if DIV_RANGE_MIN <= gap <= DIV_RANGE_MAX:
-                precio_now, precio_prev = df["high"].iloc[idx_confirma], df["high"].iloc[prev]
-                rsi_now, rsi_prev = df["rsi"].iloc[idx_confirma], df["rsi"].iloc[prev]
-                if precio_now > precio_prev and rsi_now < rsi_prev:
-                    resultado = {
-                        "tipo": "bajista", "sesgo": "SHORT",
-                        "idx_a": prev, "idx_b": idx_confirma,
-                        "precio_a": precio_prev, "precio_b": precio_now,
-                        "rsi_a": rsi_prev, "rsi_b": rsi_now,
-                        "vela_confirma": df.iloc[idx_confirma]["close_time"],
-                    }
+        # --- pivot high en idx_confirma: divergencia bajista (sesgo SHORT) ---
+        if ph[idx_confirma]:
+            anteriores = [i for i in range(0, idx_confirma) if ph[i]]
+            if anteriores:
+                prev = anteriores[-1]
+                gap = idx_confirma - prev
+                if DIV_RANGE_MIN <= gap <= DIV_RANGE_MAX:
+                    precio_now, precio_prev = df["high"].iloc[idx_confirma], df["high"].iloc[prev]
+                    rsi_now, rsi_prev = df["rsi"].iloc[idx_confirma], df["rsi"].iloc[prev]
+                    if precio_now > precio_prev and rsi_now < rsi_prev:
+                        resultados.append({
+                            "tipo": "bajista", "sesgo": "SHORT",
+                            "idx_a": prev, "idx_b": idx_confirma,
+                            "precio_a": precio_prev, "precio_b": precio_now,
+                            "rsi_a": rsi_prev, "rsi_b": rsi_now,
+                            "vela_confirma": df.iloc[idx_confirma]["close_time"],
+                            "df": df,
+                        })
 
-    if resultado is None:
-        return None
-
-    resultado["df"] = df
-    return resultado
+    return resultados
 
 
 def analizar_divergencias(par: str) -> list[dict]:
@@ -187,8 +188,11 @@ def analizar_divergencias(par: str) -> list[dict]:
             continue
         if len(df) < 80:
             continue
-        div = detectar_divergencia_tf(df)
-        if div:
+        # se mira una ventana de barras recientes (no solo la ultima) para
+        # no perder ninguna confirmacion entre corrida y corrida del bot
+        ventana = {"1h": 10, "4h": 6, "1d": 3}.get(tf, 10)
+        divs = detectar_divergencias_tf(df, ventana_reciente=ventana)
+        for div in divs:
             div["par"] = par
             div["tf"] = tf
             encontradas.append(div)
@@ -351,7 +355,7 @@ def responder_estado(comando: str):
             "\U0001F916 Bot de divergencias RSI - TEO\n\n"
             "Comandos:\n"
             "/hoy o /estado - ultimas divergencias detectadas hoy\n\n"
-            "Escaneo automatico cada ~5 min en 1m/1h/4h/1d para "
+            "Escaneo automatico cada ~5 min en 1h/4h/1d para "
             "SOL, ETH, BTC, BNB y XRP. Te llega el chart con la "
             "divergencia marcada y el sesgo (LONG/SHORT)."
         )
@@ -423,7 +427,7 @@ def main():
 
     if "--test" in sys.argv:
         enviar_texto("\u2705 Bot de divergencias RSI conectado. "
-                     "Escaneando 1m/1h/4h/1d en: " + ", ".join(PARES))
+                     "Escaneando 1h/4h/1d en: " + ", ".join(PARES))
         print("Mensaje de prueba enviado.")
         return
 
